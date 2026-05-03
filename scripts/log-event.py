@@ -177,6 +177,24 @@ def make_complex_attr(key: str, val: object) -> dict:
     return {"key": key, "value": to_otlp_anyvalue(val)}
 
 
+def resolve_project(workspace_root: str) -> str:
+    """Derive a project slug from a workspace root path.
+
+    Normalises Windows backslashes and URI-style ``/C:/...`` prefixes to
+    forward slashes, strips trailing separators, returns the basename.
+    Examples:
+        /home/kyle/services/synapse              -> synapse
+        /C:/Users/x/projects/CompromisedAccount  -> CompromisedAccount
+        C:\\Users\\x\\projects\\Foo               -> Foo
+    """
+    if not workspace_root:
+        return ""
+    cleaned = workspace_root.replace("\\", "/").rstrip("/")
+    if "/" not in cleaned:
+        return cleaned
+    return cleaned.rsplit("/", 1)[-1]
+
+
 def build_span(
     trace_id: str,
     span_id: str,
@@ -768,8 +786,14 @@ def build_child_spans_from_calls(
     model_default: str,
     ts_nano: int,
     subagent_type: str = "",
+    session_cwd: str = "",
+    session_project: str = "",
 ) -> tuple[list[dict], list[dict], list[dict], dict, dict]:
     """Build child spans and accumulate state from API calls.
+
+    ``session_cwd`` / ``session_project`` are stamped on every child span so
+    downstream consumers can group chat spans by project without having to
+    walk back to the root span.
 
     Returns (spans, new_messages, new_cost_details, usage_deltas, tools_meta).
     """
@@ -859,6 +883,11 @@ def build_child_spans_from_calls(
         if cost is not None:
             attrs.append(make_double_attr("operation.cost", cost))
 
+        if session_cwd:
+            attrs.append(make_attr("session.cwd", session_cwd))
+        if session_project:
+            attrs.append(make_attr("session.project", session_project))
+
         if out_tools:
             attrs.append(make_complex_attr("claude_code.tools_used", out_tools))
         if categories:
@@ -908,6 +937,7 @@ def handle_session_start(
     try:
         root_span_id = random_span_id()
         cwd = inp.get("cwd", "")
+        project = resolve_project(cwd)
         model = inp.get("model", "")
         term_program = os.environ.get("TERM_PROGRAM", "")
 
@@ -930,6 +960,7 @@ def handle_session_start(
             "parent_span_id": parent_span_id_from_env,
             "start_time": str(ts_nano),
             "cwd": cwd,
+            "project": project,
             "model": model,
             "term_program": term_program,
             "transcript_path": transcript_path,
@@ -963,6 +994,8 @@ def handle_session_start(
             attrs.append(make_attr("model_name", model))
         if cwd:
             attrs.append(make_attr("session.cwd", cwd))
+        if project:
+            attrs.append(make_attr("session.project", project))
 
         span = build_span(
             trace_id,
@@ -1014,6 +1047,8 @@ def handle_stop(
         root_span_id = state["root_span_id"]
         last_line = state.get("last_line", 0)
         model_default = state.get("model", "")
+        session_cwd = state.get("cwd", "")
+        session_project = state.get("project", "") or resolve_project(session_cwd)
 
         subagent_type = ""
         if hook_event == "SubagentStop":
@@ -1025,7 +1060,14 @@ def handle_stop(
             return
 
         spans, new_messages, new_cost_details, usage_deltas, tools_meta = build_child_spans_from_calls(
-            api_calls, trace_id, root_span_id, model_default, ts_nano, subagent_type=subagent_type
+            api_calls,
+            trace_id,
+            root_span_id,
+            model_default,
+            ts_nano,
+            subagent_type=subagent_type,
+            session_cwd=session_cwd,
+            session_project=session_project,
         )
 
         if spans:
@@ -1068,6 +1110,7 @@ def handle_session_end(
         state_parent_span_id = state.get("parent_span_id", "")
         start_time = state.get("start_time", str(ts_nano))
         cwd = state.get("cwd", "")
+        project = state.get("project", "") or resolve_project(cwd)
         model = state.get("model", "")
 
         # Final transcript parse for any remaining messages
@@ -1078,7 +1121,13 @@ def handle_session_end(
             remaining_calls, new_total = parse_transcript_slice(final_tp, last_line)
             if remaining_calls:
                 spans, new_msgs, new_costs, usage_deltas, tools_meta = build_child_spans_from_calls(
-                    remaining_calls, trace_id, root_span_id, model, ts_nano
+                    remaining_calls,
+                    trace_id,
+                    root_span_id,
+                    model,
+                    ts_nano,
+                    session_cwd=cwd,
+                    session_project=project,
                 )
                 if spans:
                     payload = build_otlp_envelope(spans)
@@ -1118,6 +1167,8 @@ def handle_session_end(
         attrs.append(make_attr("session.id", session_id))
         if cwd:
             attrs.append(make_attr("session.cwd", cwd))
+        if project:
+            attrs.append(make_attr("session.project", project))
         if final_result is not None:
             attrs.append(make_complex_attr("final_result", final_result))
         attrs.append(make_complex_attr("pydantic_ai.all_messages", all_messages))
