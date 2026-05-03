@@ -195,6 +195,42 @@ def resolve_project(workspace_root: str) -> str:
     return cleaned.rsplit("/", 1)[-1]
 
 
+def resolve_anchor(transcript_path: str, fallback_cwd: str = "") -> tuple:
+    """Derive (cwd, project) from the session anchor.
+
+    Claude Code stores session JSONLs under
+    ``~/.claude/projects/{encoded_anchor}/{session_id}.jsonl`` where
+    ``encoded_anchor`` is the session anchor with ``/`` replaced by ``-``.
+    The parent dir name is the canonical session anchor — more reliable
+    than the hook payload's ``cwd`` field, which drifts on ``--continue``
+    chains and can flip mid-session to subprocess working dirs.
+
+    Falls back to ``fallback_cwd`` when no transcript_path is available
+    (e.g. SessionStart fires before the transcript file exists).
+    """
+    if transcript_path:
+        parent = os.path.basename(os.path.dirname(transcript_path))
+        if parent and parent != "-":
+            naive = "/" + parent.lstrip("-").replace("-", "/")
+            # Fast path: naive decode exists on disk.
+            if os.path.isdir(naive):
+                return naive, os.path.basename(naive)
+            # Hyphenated-basename path: walk down from the longest existing
+            # directory prefix, then treat remaining segments as one
+            # dash-joined basename. Handles e.g. "logfire-reviewer".
+            parts = parent.lstrip("-").split("-")
+            for split in range(len(parts) - 1, 0, -1):
+                prefix = "/" + "/".join(parts[:split])
+                if os.path.isdir(prefix):
+                    name = "-".join(parts[split:])
+                    # Honor the longest existing parent — even if the
+                    # basename dir itself was deleted, name is still right.
+                    return prefix + "/" + name, name
+            # Last resort: naive decode + last dash-segment as project name.
+            return naive, parts[-1]
+    return fallback_cwd, resolve_project(fallback_cwd)
+
+
 def build_span(
     trace_id: str,
     span_id: str,
@@ -936,8 +972,7 @@ def handle_session_start(
         return
     try:
         root_span_id = random_span_id()
-        cwd = inp.get("cwd", "")
-        project = resolve_project(cwd)
+        cwd, project = resolve_anchor(transcript_path, inp.get("cwd", ""))
         model = inp.get("model", "")
         term_program = os.environ.get("TERM_PROGRAM", "")
 
@@ -1048,7 +1083,9 @@ def handle_stop(
         last_line = state.get("last_line", 0)
         model_default = state.get("model", "")
         session_cwd = state.get("cwd", "")
-        session_project = state.get("project", "") or resolve_project(session_cwd)
+        session_project = state.get("project", "")
+        if not session_project:
+            session_cwd, session_project = resolve_anchor(transcript_path, session_cwd)
 
         subagent_type = ""
         if hook_event == "SubagentStop":
@@ -1110,7 +1147,9 @@ def handle_session_end(
         state_parent_span_id = state.get("parent_span_id", "")
         start_time = state.get("start_time", str(ts_nano))
         cwd = state.get("cwd", "")
-        project = state.get("project", "") or resolve_project(cwd)
+        project = state.get("project", "")
+        if not project:
+            cwd, project = resolve_anchor(state.get("transcript_path", ""), cwd)
         model = state.get("model", "")
 
         # Final transcript parse for any remaining messages
